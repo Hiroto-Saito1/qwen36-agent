@@ -1,0 +1,12 @@
+.DS_Store
+.env
+node_modules/
+.qwen/settings.json
+scripts/__pycache__/
+__pycache__/
+*.pyc
+work/*
+!work/README.md
+output/
+*.tmp
+*.part
