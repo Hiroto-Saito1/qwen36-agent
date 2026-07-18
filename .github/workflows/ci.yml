@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    name: Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.13"]
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Run unit tests
+        run: python -m unittest discover -s tests
+
+      - name: Run template self-test
+        run: python outputs/video-event-search-template/video_event_search.py --self-test
+
+      - name: Compile Python files
+        run: |
+          find . \
+            -path './.git' -prune -o \
+            -path './work' -prune -o \
+            -path './outputs/video-event-search-template/__pycache__' -prune -o \
+            -path './scripts/__pycache__' -prune -o \
+            -name '*.py' -print0 | xargs -0 python -m py_compile
+
+      - name: Validate JSON files
+        run: |
+          find . \
+            -path './.git' -prune -o \
+            -path './work' -prune -o \
+            -path './.qwen/settings.json' -prune -o \
+            -name '*.json' -print0 | xargs -0 -n1 python -m json.tool >/dev/null
+
+      - name: Check shell script syntax
+        shell: bash
+        run: |
+          find . \
+            -path './.git' -prune -o \
+            -path './work' -prune -o \
+            -name '*.sh' -print0 | xargs -0 -n1 bash -n

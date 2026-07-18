@@ -1,0 +1,31 @@
+{
+  "permissions": {
+    "deny": [
+      "WebFetch",
+      "Agent",
+      "Skill",
+      "Bash(rm *)",
+      "Bash(rmdir *)",
+      "Bash(unlink *)",
+      "Bash(ssh *)",
+      "Bash(scp *)",
+      "Bash(rsync *)",
+      "Read(//Users/YOUR_USER/.ssh/**)",
+      "Read(//Users/YOUR_USER/.codex/**)",
+      "Read(//Users/YOUR_USER/.qwen/**)",
+      "Read(//Users/YOUR_USER/Documents/**)",
+      "Read(//Users/YOUR_USER/Desktop/**)",
+      "Read(//Users/YOUR_USER/Downloads/**)",
+      "Read(//Users/YOUR_USER/Library/**)",
+      "Read(//Volumes/**)"
+    ],
+    "ask": [
+      "Edit",
+      "Write"
+    ]
+  },
+  "tools": {
+    "approvalMode": "default"
+  },
+  "$version": 4
+}

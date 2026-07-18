@@ -1,0 +1,93 @@
+# JSON駆動の動画イベント探索テンプレート
+
+このテンプレートは、ローカル動画から「指定した条件が成立する時刻」を探すためのものです。
+
+現在の標準方式は `retrieve_verify` です。まず軽量な画像テキスト検索モデルで動画全体を細かくスキャンし、条件に近い候補区間だけをQwen VLで検証します。その後、見つかった成立サンプルの前後だけ境界を詰めます。
+
+この方式では、昔のように30秒区間をいきなり二分探索しません。最初の粗いフレームに該当シーンがぴったり写っていなくても、検索モデルの類似度が高い区間を拾えるため、短いイベントに少し強くなります。
+
+## 初回セットアップ
+
+イベント探索には、VLサーバーとは別に軽量検索モデル用のPython環境が必要です。
+
+```bash
+cd /path/to/qwen36-agent/workspace
+./scripts/setup-vision-env.sh
+```
+
+このコマンドは `../vision-env/` を作り、`../models/retrieval/` に `google/siglip2-base-patch16-224` を取得します。
+
+## 使い方
+
+1. `input.example.json` をコピーするか、同じ形のJSONを用意します。
+2. `video_path` に調べたい動画ファイルを指定します。
+3. `condition` に探したい条件を書きます。
+4. `search.scan_interval_seconds` に全体スキャンの間隔を指定します。
+5. `search.score_threshold` に候補選択とVL成立判定で共通に使うしきい値を指定します。
+6. `output_directory` に結果を置く場所を指定します。
+
+実行例:
+
+```bash
+cd /path/to/qwen36-agent/workspace/outputs/video-event-search-template
+./reproduce.sh input.example.json
+```
+
+`output_directory` や `video_path` が相対パスの場合は、入力JSONが置かれているディレクトリを基準に解釈します。
+
+## 入力JSONの意味
+
+| キー | 意味 |
+| --- | --- |
+| `video_path` | 調べたいローカル動画ファイル |
+| `condition` | 探したい条件。検索モデルにもVL検証にもそのまま渡します |
+| `output_directory` | 結果の保存先 |
+| `language` | キャプションと根拠の言語 |
+| `search.strategy` | 探索方式。現在は `retrieve_verify` |
+| `search.scan_interval_seconds` | 動画全体を軽量検索する間隔。1時間動画ならまず `2.0` か `3.0` |
+| `search.score_threshold` | 共通しきい値。検索候補の選択と、VLが成立とみなす最低信頼度に使います |
+| `search.minimum_event_duration_seconds` | 想定する最短イベント長。短いイベントを探すなら下げます |
+| `search.local_scan_interval_seconds` | 候補区間内をQwen VLで見る間隔 |
+| `search.boundary_tolerance_seconds` | 成立区間の前後境界を詰める最終粒度 |
+| `search.retrieval_model` | 軽量検索モデル。標準は `google/siglip2-base-patch16-224` |
+| `search.retrieval_content_filter` | 標準は `none`。このテンプレートは追加フィルタを入れません |
+| `search.candidate_padding_seconds` | 検索で拾った時刻の前後を何秒広げてVL検証するか |
+| `search.minimum_candidate_windows` | しきい値を超える候補が少ない場合でも最低何区間は検証するか |
+| `search.max_candidate_windows` | VL検証する候補区間の上限 |
+| `search.minimum_positive_samples` | 1イベントとして採用するために必要な成立サンプル数 |
+| `search.query_texts` | 条件文以外に検索へ足す補助クエリ。空で構いません |
+| `search.required_visual_checks` | VL判定時に必須とする視覚条件。条件文だけだと誤解される場合に使います |
+| `search.not_required_visual_checks` | VLが勝手に要求しがちな不要条件。例: 色、接触、他キャラとの相互作用 |
+| `search.lexical_match_terms` | VLが `near_miss` と返しても、肯定キャプション/証拠に全語が含まれる場合だけ成立へ補正する語 |
+| `search.lexical_caption_terms` | 補正時に `neutral_caption` 側にも必ず含まれていてほしい語。証拠文への条件引っ張られ対策 |
+| `search.max_evaluations` | Qwen VL評価数の上限。`null` なら上限なし |
+
+旧方式の `caption_interval_seconds`、`candidate_threshold`、`match_threshold`、`fallback_top_intervals`、`minimum_interval_seconds` は使いません。後方互換はありません。
+
+## 調整の考え方
+
+1時間動画では、まず `scan_interval_seconds: 2.0`、`score_threshold: 0.82`、`max_candidate_windows: 8` から始めます。
+
+見落としが気になる場合は、`score_threshold` を `0.75` へ下げる、`max_candidate_windows` を増やす、または `scan_interval_seconds` を `1.0` へ下げます。候補が多すぎる場合は、`score_threshold` を上げるか `max_candidate_windows` を減らします。
+
+研究用途で「拒否なく検索したい」前提に合わせ、軽量検索段階にはキーワード拒否、NSFW分類器、マスク、ブロックリストなどを入れていません。ただし、検索モデル自体の学習データが完全に無加工である保証ではありません。
+
+## 出力
+
+| ファイル/ディレクトリ | 内容 |
+| --- | --- |
+| `output.json` | 最終結果JSON。実行中も評価ごとに完全なJSONとして上書き更新されます |
+| `captions.md` | Qwen VLで確認したフレームの説明 |
+| `captions.json` | Qwen VL確認結果 |
+| `event-search.md` | 見つかった成立時刻の人間向けまとめ |
+| `search-trace.json` | 検索スコア、候補区間、境界調整の記録 |
+| `config.snapshot.json` | 実行時の設定 |
+| `evidence/` | 各成立区間の前・代表・後フレーム |
+
+`output.json` には `condition` 本文は入れません。条件本文は `input.json` と `config.snapshot.json` を見ます。
+
+`output.json` の `retrieval_scan.samples` には、全体スキャンした各時刻の `retrieval_raw_score` と `retrieval_likelihood_score` が入ります。どの区間がなぜQwen VL検証へ進んだかは `retrieval_scan.candidate_windows` と `selected_for_verification` を見ます。
+
+VLモデルが肯定文を書きながら `near_miss` を返す場合は、`lexical_match_terms` を使うと保険になります。証拠文だけが条件文に引っ張られる誤検出を避けたい場合は、`lexical_caption_terms` も指定します。補正された評価には `override_reason` が残ります。
+
+同じ出力先で再実行すると、古い生成物は上書きされます。`input.json`、`reproduce.sh`、README、未知の手元ファイルは残します。

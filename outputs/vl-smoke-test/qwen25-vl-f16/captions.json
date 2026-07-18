@@ -1,0 +1,14 @@
+[
+  {
+    "start_time": 0.0,
+    "end_time": 1.0,
+    "frame_path": "work/vl-smoke-test/qwen25-vl-f16/frames/frame_000001.jpg",
+    "caption_ja": "テレビのテストパターンが表示されています。色のバーと黒い円が見えます。フレームの右側には小さな白い四角があります。背景は白で、フレーム全体にわたって色のバーが配置されています。"
+  },
+  {
+    "start_time": 1.0,
+    "end_time": 2.0,
+    "frame_path": "work/vl-smoke-test/qwen25-vl-f16/frames/frame_000002.jpg",
+    "caption_ja": "テレビテストパターンのフレームです。色のストライプと黒い円が見えます。カメラのフレームはシンプルで、テストパターンの背景が白です。テキストは読み取れません。"
+  }
+]
