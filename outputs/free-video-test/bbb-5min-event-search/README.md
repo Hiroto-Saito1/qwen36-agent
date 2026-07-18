@@ -3,10 +3,10 @@
 この出力は、5分版の Big Buck Bunny で次の条件が成立しそうな時刻を探す検証です。
 
 ```text
-蝶が木の幹の近くに見えている
+木の幹に矢が刺さっている
 ```
 
-現在は `retrieve_verify` 方式です。まず `search.scan_interval_seconds` ごとに軽量検索モデルで全体をスキャンし、類似度の高い候補区間だけをQwen VLで `local_scan_interval_seconds` ごとに確認します。成立サンプルが見つかったら、その前後だけ `boundary_tolerance_seconds` まで境界を詰めます。
+現在は `retrieve_verify` 方式です。まず `condition` から検索用クエリを内部生成し、`search.scan_interval_seconds` ごとに軽量検索モデルで全体をスキャンします。その後、類似度の高い候補区間だけをQwen VLで `local_scan_interval_seconds` ごとに確認します。Qwen VLは、対象フレーム1枚の一次判定後、関係ありそうな時刻だけ前後3枚で確定します。成立サンプルが見つかったら、その前後だけ `boundary_tolerance_seconds` まで境界を詰めます。
 
 再現方法:
 
@@ -25,19 +25,18 @@ cd /path/to/qwen36-agent/workspace/outputs/free-video-test/bbb-5min-event-search
 - `output.json`: 機械処理用の最終JSON。成立時刻は `occurrences` に入ります。
 - `output.json` の `retrieval_scan.samples`: 全体スキャンで各時刻がどれくらい条件に近かったか。
 - `output.json` の `retrieval_scan.candidate_windows`: Qwen VLで検証した候補区間。
-- `output.json` の `verification.evaluations`: Qwen VLの判定、信頼度、否定理由。
+- `output.json` の `verification.evaluations`: Qwen VLの一次判定、3枚確認、信頼度、否定理由。
+- `output.json` の `verification`: VLリクエスト数、送信画像数、縮小後の入力サイズ。
 - `event-search.md`: 人間向けの要約。
-- `search-trace.json`: 検索・検証・境界調整の詳細。
+- `search-trace.json`: 検索・検証・境界調整の詳細。内部生成された検索クエリもここで確認できます。
 
-この検証では `score_threshold: 0.70`、`scan_interval_seconds: 2.0`、`local_scan_interval_seconds: 2.0`、`minimum_candidate_windows: 6`、`max_candidate_windows: 6` を使います。軽量検索だけの事前確認では、狙いの200秒台が候補区間に入る設定です。
+この検証では `score_threshold: 0.70`、`scan_interval_seconds: 10.0`、`local_scan_interval_seconds: 2.0`、`candidate_padding_seconds: 8.0`、`minimum_candidate_windows: 3`、`max_candidate_windows: 3`、`minimum_positive_samples: 1`、`max_evaluations: 80`、`verification_image_max_edge_pixels: 960` を使います。5分動画でも、1時間動画用テンプレートに近い軽めの探索設定で通るかを確認するためです。1時間動画用の初期設定は `outputs/video-event-search-template/input.example.json` を使います。
 
-以前の「紫色の蝶」や「木の幹の上」条件は、VL側が色や厳密な接触関係を不安定に扱って `near_miss` を返すことがありました。この検証では探索ロジックそのものを確認するため、「木の幹の近く」という視覚的に安定した条件にしています。
+以前の「紫色の蝶」や「蝶が木の幹の近く」条件は、VL側が小さい対象や厳密な位置関係を不安定に扱って `near_miss` を返すことがありました。この検証では探索ロジックそのものを確認するため、「木の幹に矢が刺さっている」という視覚的に安定した条件にしています。
 
-`input.json` には `required_visual_checks` と `not_required_visual_checks` も入れています。これは、VLが条件にない「色」「接触」「他キャラとの相互作用」を勝手に必須扱いしないようにするためです。
+`input.json` で人間が書く意味入力は `condition` だけです。補助クエリ、必須チェック、不要チェック、語彙補正は使いません。検索用の短いクエリは起動時に自動生成され、`config.snapshot.json` と `search-trace.json` の `retrieval_query_plan` に記録されます。
 
-さらに `lexical_match_terms` に `蝶`、`木の幹`、`近く`、`lexical_caption_terms` に `蝶`、`木の幹` を入れています。VLが肯定キャプションを書きながら `near_miss` と返した場合、証拠文だけでなく neutral_caption 側にも主要語が出ているときだけ成立へ補正し、`output.json` の `override_reason` に記録します。
-
-本番の長い動画では、候補が多すぎる場合に `score_threshold` を `0.82` へ上げるか、`max_candidate_windows` を減らします。見落としが気になる場合は、`score_threshold` を下げるか、`scan_interval_seconds` を短くします。
+本番の長い動画では、候補が多すぎる場合に `score_threshold` を `0.82` へ上げるか、`max_candidate_windows` を減らします。VL検証が重い場合は `verification_image_max_edge_pixels` を `640` へ下げます。見落としが気になる場合は、`score_threshold` を下げるか、`scan_interval_seconds` を短くします。
 
 古い `event-search.json` は使いません。
 

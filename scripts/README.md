@@ -108,8 +108,9 @@ cd /path/to/qwen36-agent/workspace
 - `llama-server` を次の条件で起動します。
   - alias: `qwen2.5-vl-7b-instruct-abliterated-q4km`
   - mmproj: f16版
-  - image min tokens: `1024`
-  - context: `16384`
+  - image min tokens: `256`
+  - image max tokens: `768`
+  - context: `8192`
   - parallel: `-np 1`
   - GPU layers: `-ngl 99`
   - host: `127.0.0.1`
@@ -205,7 +206,11 @@ cd /path/to/qwen36-agent/workspace
 
 `video_event_search.py` は `outputs/video-event-search-template/` に置いています。成果物ごとに `reproduce.sh` と `input.json` を持たせるため、テンプレート本体も `outputs/` 側にあります。
 
-現在の探索方式は `retrieve_verify` です。`scan_interval_seconds` ごとに軽量検索モデルで全体を見て、スコア上位の候補区間だけをQwen VLで検証します。古い `candidate_binary`、`caption_interval_seconds`、`candidate_threshold`、`match_threshold` は使いません。
+現在の探索方式は `retrieve_verify` です。`condition` から検索用クエリを内部生成し、`scan_interval_seconds` ごとに軽量検索モデルで全体を見て、スコア上位の候補区間だけをQwen VLで検証します。1時間動画向けテンプレートでは、Qwen VLへ送る画像を既定で長辺640pxに縮小します。
+
+候補区間内では、まず対象フレーム1枚で一次判定します。`match`、`near_miss`、`uncertain` の場合だけ、前後フレームを含む3枚で確認します。`unrelated` はそこで止めるため、長い動画でも確認リクエスト数を抑えやすくなっています。
+
+古い `candidate_binary`、`caption_interval_seconds`、`candidate_threshold`、`match_threshold` は使いません。
 
 詳しい使い方は次を見てください。
 

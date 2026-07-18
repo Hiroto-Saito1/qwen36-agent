@@ -44,6 +44,7 @@ cd /path/to/qwen36-agent/workspace/outputs/free-video-test/bbb-5min-event-search
 ```
 
 結果は同じディレクトリの `output.json` と `event-search.md` を見ます。機械処理用の結果JSONは `output.json` だけです。実行中も評価ごとに更新されます。古い `event-search.json` は使いません。
+1時間程度の動画では、テンプレートはVLへ送る画像を既定で長辺640pxへ縮小します。画質を優先したい場合は入力JSONの `search.verification_image_max_edge_pixels` を `960` や `1280` へ上げ、速度を優先したい場合は `480` などへ下げます。
 
 ## ディレクトリ構成
 
@@ -73,5 +74,6 @@ qwen36-agent
 - 動画素材、抽出フレーム、途中キャッシュは `work/` に置きます。
 - `models/` は `workspace/` の外に置き、巨大なGGUFをGit管理しません。
 - 動画イベント探索では、軽量検索モデルで候補区間を拾い、Qwen VLで候補区間だけを検証します。
+- Qwen VL検証は、まず対象フレーム1枚で一次判定し、関係ありそうな時刻だけ前後を含む3枚で確定します。
 - 入力JSONと同じ出力ディレクトリに `output.json`、`event-search.md`、`search-trace.json` が生成されます。
 - 同じ出力ディレクトリで再実行すると、古い生成結果は上書きされます。`input.json`、`reproduce.sh`、README、未知の手元ファイルは残します。

@@ -1,12 +1,12 @@
 {
   "video_path": "workspace/work/free-video-test/big_buck_bunny_5min.mp4",
   "output_directory": "workspace/outputs/free-video-test/bbb-5min-event-search",
-  "condition": "蝶が木の幹の近くに見えている",
+  "condition": "木の幹に矢が刺さっている",
   "language": "Japanese",
   "model": "qwen2.5-vl-7b-instruct-abliterated-q4km",
   "search": {
     "strategy": "retrieve_verify",
-    "scan_interval_seconds": 2.0,
+    "scan_interval_seconds": 10.0,
     "score_threshold": 0.7,
     "minimum_event_duration_seconds": 5.0,
     "local_scan_interval_seconds": 2.0,
@@ -14,38 +14,25 @@
     "retrieval_model": "google/siglip2-base-patch16-224",
     "retrieval_cache_dir": "models/retrieval",
     "retrieval_content_filter": "none",
-    "candidate_padding_seconds": 4.0,
-    "minimum_candidate_windows": 6,
-    "max_candidate_windows": 6,
-    "minimum_positive_samples": 2,
+    "candidate_padding_seconds": 8.0,
+    "minimum_candidate_windows": 3,
+    "max_candidate_windows": 3,
+    "minimum_positive_samples": 1,
     "retrieval_batch_size": 32,
-    "query_texts": [
-      "蝶が木の幹の近くに見えている",
-      "butterfly near a tree trunk",
-      "small butterfly near a tree",
-      "蝶 木の幹"
-    ],
-    "required_visual_checks": [
-      "蝶が見えている",
-      "木の幹が見えている",
-      "蝶が木の幹の近くにいる"
-    ],
-    "not_required_visual_checks": [
-      "蝶が木の幹の上に乗っていること",
-      "蝶が木の幹に触れていること",
-      "蝶の色が紫であること",
-      "リスや猫と相互作用していること"
-    ],
-    "lexical_match_terms": [
-      "蝶",
-      "木の幹",
-      "近く"
-    ],
-    "lexical_caption_terms": [
-      "蝶",
-      "木の幹"
-    ],
-    "max_evaluations": null,
+    "retrieval_query_plan": {
+      "compiler_version": "condition-only-v1",
+      "condition_sha256": "a086e71c50908d262a24a3479b6dd14815b2cbd2e10f6ba090ca368cf79f91b1",
+      "queries": [
+        "arrow stuck in tree trunk"
+      ],
+      "source": "model",
+      "cache_hit": true,
+      "setup_request_count": 0,
+      "fallback_reason": "",
+      "warnings": []
+    },
+    "verification_image_max_edge_pixels": 960,
+    "max_evaluations": 80,
     "request_retries": 2,
     "request_timeout_seconds": 300,
     "context_seconds": 1.0,

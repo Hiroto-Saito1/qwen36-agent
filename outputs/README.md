@@ -16,6 +16,8 @@
 - Reproduce: `outputs/video-event-search-template/reproduce.sh`
 - Work/cache files: `work/video-event-search/`
 - Result JSON: `output.json` (updated after each evaluation while the search is running)
+- VL image resizing: the 1-hour template uses a 640px max edge by default, configurable by `search.verification_image_max_edge_pixels`
+- Semantic input: write all visual requirements in `condition`; retrieval queries are generated internally and recorded in `config.snapshot.json` / `search-trace.json`
 - Retrieval setup: `scripts/setup-vision-env.sh`
 
 ## Free video 5-minute event search
@@ -31,3 +33,4 @@
 Each output directory contains its own `reproduce.sh`. These scripts use the local Qwen2.5-VL server on `http://127.0.0.1:8081/v1`. If the server is not running, the scripts start it and stop only the server process they started.
 
 Video event search also uses `../vision-env/` for the lightweight retrieval model. Run `scripts/setup-vision-env.sh` once before reproducing event-search outputs.
+For high-resolution videos, lower `search.verification_image_max_edge_pixels` to reduce VL verification time, or set it to `null` to send original-resolution frames.

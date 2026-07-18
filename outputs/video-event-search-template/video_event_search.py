@@ -9,6 +9,7 @@ import json
 import mimetypes
 import os
 import pathlib
+import re
 import shutil
 import subprocess
 import sys
@@ -17,7 +18,8 @@ import urllib.request
 from typing import Any, Optional
 
 
-SCRIPT_VERSION = "2026-07-18.17"
+SCRIPT_VERSION = "2026-07-18.20"
+QUERY_COMPILER_VERSION = "condition-only-v1"
 DEFAULT_ENDPOINT = "http://127.0.0.1:8081/v1"
 DEFAULT_MODEL = "qwen2.5-vl-7b-instruct-abliterated-q4km"
 DEFAULT_RETRIEVAL_MODEL = "google/siglip2-base-patch16-224"
@@ -63,11 +65,9 @@ class SearchConfig:
     max_candidate_windows: int
     minimum_positive_samples: int
     retrieval_batch_size: int
-    query_texts: tuple[str, ...]
-    required_visual_checks: tuple[str, ...]
-    not_required_visual_checks: tuple[str, ...]
-    lexical_match_terms: tuple[str, ...]
-    lexical_caption_terms: tuple[str, ...]
+    retrieval_queries: tuple[str, ...]
+    query_plan: dict[str, Any]
+    verification_image_max_edge_pixels: Optional[int]
     max_evaluations: Optional[int]
     request_retries: int
     request_timeout: int
@@ -164,6 +164,12 @@ def optional_int_or_null(data: dict[str, Any], key: str) -> Optional[int]:
     return result
 
 
+def optional_int_or_null_default(data: dict[str, Any], key: str, default: Optional[int]) -> Optional[int]:
+    if key not in data:
+        return default
+    return optional_int_or_null(data, key)
+
+
 def optional_int(data: dict[str, Any], key: str, default: int) -> int:
     value = data.get(key, default)
     if isinstance(value, bool):
@@ -194,16 +200,19 @@ def clamp_score(value: Any, default: float = 0.0) -> float:
     return max(0.0, min(1.0, result))
 
 
-def boolish(value: Any) -> Optional[bool]:
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, str):
-        lowered = value.strip().lower()
-        if lowered in {"true", "yes", "1"}:
-            return True
-        if lowered in {"false", "no", "0"}:
-            return False
-    return None
+def even_dimension(value: int) -> int:
+    if value <= 2:
+        return max(1, value)
+    return max(2, value - (value % 2))
+
+
+def scaled_dimensions(width: int, height: int, max_edge_pixels: Optional[int]) -> tuple[int, int]:
+    if width <= 0 or height <= 0:
+        raise ValueError("Image dimensions must be positive.")
+    if max_edge_pixels is None or max(width, height) <= max_edge_pixels:
+        return width, height
+    scale = max_edge_pixels / float(max(width, height))
+    return even_dimension(round(width * scale)), even_dimension(round(height * scale))
 
 
 def project_path(path: pathlib.Path) -> str:
@@ -235,6 +244,17 @@ def load_config(path: pathlib.Path, endpoint_override: Optional[str], model_over
         removed = ", ".join(sorted([*removed_top_level, *(f"search.{key}" for key in removed_search)]))
         raise ConfigError(f"{removed} are from the old candidate_binary schema. Use search.scan_interval_seconds and search.score_threshold.")
 
+    removed_semantic_search = {
+        "query_texts",
+        "required_visual_checks",
+        "not_required_visual_checks",
+        "lexical_match_terms",
+        "lexical_caption_terms",
+    } & set(search)
+    if removed_semantic_search:
+        removed = ", ".join(sorted(f"search.{key}" for key in removed_semantic_search))
+        raise ConfigError(f"{removed} are no longer supported. Put all event semantics in 'condition'.")
+
     video_path = resolve_path(require_text(data, "video_path"), base_dir)
     output_dir = resolve_path(require_text(data, "output_directory"), base_dir)
     condition = require_text(data, "condition")
@@ -265,11 +285,7 @@ def load_config(path: pathlib.Path, endpoint_override: Optional[str], model_over
     temperature = optional_float(search, "temperature", 0.1)
     max_tokens = optional_int(search, "max_tokens", 320)
 
-    query_texts = tuple(dict.fromkeys([condition, *optional_text_list(search, "query_texts")]))
-    required_visual_checks = optional_text_list(search, "required_visual_checks")
-    not_required_visual_checks = optional_text_list(search, "not_required_visual_checks")
-    lexical_match_terms = optional_text_list(search, "lexical_match_terms")
-    lexical_caption_terms = optional_text_list(search, "lexical_caption_terms")
+    verification_image_max_edge_pixels = optional_int_or_null_default(search, "verification_image_max_edge_pixels", 640)
 
     if not video_path.exists():
         raise ConfigError(f"Video not found: {video_path}")
@@ -294,6 +310,8 @@ def load_config(path: pathlib.Path, endpoint_override: Optional[str], model_over
         raise ConfigError("'search.retrieval_content_filter' must be 'none'. This template does not add content filters.")
     if context_seconds < 0:
         raise ConfigError("'search.context_seconds' must be greater than or equal to 0.")
+    if verification_image_max_edge_pixels is not None and verification_image_max_edge_pixels < 64:
+        raise ConfigError("'search.verification_image_max_edge_pixels' must be at least 64, or null.")
 
     canonical = {
         "video_path": project_path(video_path),
@@ -316,11 +334,8 @@ def load_config(path: pathlib.Path, endpoint_override: Optional[str], model_over
             "max_candidate_windows": max_candidate_windows,
             "minimum_positive_samples": minimum_positive_samples,
             "retrieval_batch_size": retrieval_batch_size,
-            "query_texts": list(query_texts),
-            "required_visual_checks": list(required_visual_checks),
-            "not_required_visual_checks": list(not_required_visual_checks),
-            "lexical_match_terms": list(lexical_match_terms),
-            "lexical_caption_terms": list(lexical_caption_terms),
+            "retrieval_query_plan": {},
+            "verification_image_max_edge_pixels": verification_image_max_edge_pixels,
             "max_evaluations": max_evaluations,
             "request_retries": request_retries,
             "request_timeout_seconds": request_timeout,
@@ -353,11 +368,9 @@ def load_config(path: pathlib.Path, endpoint_override: Optional[str], model_over
         max_candidate_windows=max_candidate_windows,
         minimum_positive_samples=minimum_positive_samples,
         retrieval_batch_size=retrieval_batch_size,
-        query_texts=query_texts,
-        required_visual_checks=required_visual_checks,
-        not_required_visual_checks=not_required_visual_checks,
-        lexical_match_terms=lexical_match_terms,
-        lexical_caption_terms=lexical_caption_terms,
+        retrieval_queries=(),
+        query_plan={},
+        verification_image_max_edge_pixels=verification_image_max_edge_pixels,
         max_evaluations=max_evaluations,
         request_retries=request_retries,
         request_timeout=request_timeout,
@@ -447,6 +460,33 @@ def ffprobe_duration(video_path: pathlib.Path) -> float:
     return duration
 
 
+def ffprobe_video_dimensions(video_path: pathlib.Path) -> dict[str, int]:
+    raw = run_capture([
+        "ffprobe",
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "stream=width,height",
+        "-of",
+        "json",
+        str(video_path),
+    ])
+    streams = json.loads(raw).get("streams", [])
+    if not streams:
+        return {}
+    stream = streams[0]
+    try:
+        width = int(stream["width"])
+        height = int(stream["height"])
+    except (KeyError, TypeError, ValueError):
+        return {}
+    if width <= 0 or height <= 0:
+        return {}
+    return {"width": width, "height": height}
+
+
 def sample_key(time_seconds: float) -> str:
     return f"{int(round(time_seconds * 1000)):010d}"
 
@@ -520,6 +560,87 @@ def extract_scan_frames(video_path: pathlib.Path, times: list[float], frame_dir:
     return frames
 
 
+def image_dimensions(path: pathlib.Path) -> tuple[int, int]:
+    raw = run_capture([
+        "ffprobe",
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "stream=width,height",
+        "-of",
+        "json",
+        str(path),
+    ])
+    streams = json.loads(raw).get("streams", [])
+    if not streams:
+        raise RuntimeError(f"Could not read image dimensions: {path}")
+    stream = streams[0]
+    try:
+        width = int(stream["width"])
+        height = int(stream["height"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError(f"Could not read image dimensions: {path}") from exc
+    if width <= 0 or height <= 0:
+        raise RuntimeError(f"Image dimensions must be positive: {path}")
+    return width, height
+
+
+def resize_frame_for_verification(
+    cfg: SearchConfig,
+    cache_dir: pathlib.Path,
+    source_path: pathlib.Path,
+    role: str,
+    time_seconds: float,
+) -> dict[str, Any]:
+    original_width, original_height = image_dimensions(source_path)
+    input_width, input_height = scaled_dimensions(original_width, original_height, cfg.verification_image_max_edge_pixels)
+    resized = (input_width, input_height) != (original_width, original_height)
+    if resized:
+        max_edge = cfg.verification_image_max_edge_pixels
+        output_dir = cache_dir / "vl-frames"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        input_path = output_dir / f"{role}_{sample_key(time_seconds)}_max{max_edge}.jpg"
+        if not input_path.exists():
+            tmp_path = input_path.with_name(f".{input_path.name}.tmp.jpg")
+            if tmp_path.exists():
+                tmp_path.unlink()
+            run_quiet([
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-i",
+                str(source_path),
+                "-vf",
+                f"scale={input_width}:{input_height}",
+                "-q:v",
+                "4",
+                "-pix_fmt",
+                "yuvj420p",
+                "-y",
+                str(tmp_path),
+            ])
+            if not tmp_path.exists():
+                raise RuntimeError(f"ffmpeg did not create resized frame: {input_path}")
+            tmp_path.replace(input_path)
+    else:
+        input_path = source_path
+    return {
+        "role": role,
+        "time": round(time_seconds, 3),
+        "source_frame_path": workspace_path(source_path),
+        "model_frame_path": workspace_path(input_path),
+        "original_width": original_width,
+        "original_height": original_height,
+        "model_input_width": input_width,
+        "model_input_height": input_height,
+        "resized": resized,
+        "_model_frame_abs": input_path,
+    }
+
+
 def image_data_url(path: pathlib.Path) -> str:
     mime = mimetypes.guess_type(path.name)[0] or "image/jpeg"
     encoded = base64.b64encode(path.read_bytes()).decode("ascii")
@@ -567,19 +688,194 @@ def extract_json_object(text: str) -> dict[str, Any]:
     raise ValueError("No JSON object found in model response.")
 
 
-def normalize_visual_evidence(value: Any) -> bool:
-    direct = boolish(value)
-    if direct is not None:
-        return direct
-    if isinstance(value, dict):
-        if not value:
-            return False
-        return all(boolish(item) is True for item in value.values())
-    if isinstance(value, list):
-        if not value:
-            return False
-        return all(boolish(item) is True for item in value)
-    return False
+def normalize_compiled_queries(value: Any) -> list[str]:
+    if isinstance(value, str):
+        values = [value]
+    elif isinstance(value, list):
+        values = value
+    else:
+        values = []
+
+    queries: list[str] = []
+    seen: set[str] = set()
+    for item in values:
+        if not isinstance(item, str):
+            continue
+        query = " ".join(item.strip().split())
+        if not query:
+            continue
+        query = query[:180].strip()
+        key = query.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        queries.append(query)
+        if len(queries) >= 3:
+            break
+    return queries
+
+
+def condition_query_cache_key(cfg: SearchConfig) -> str:
+    identity = {
+        "compiler_version": QUERY_COMPILER_VERSION,
+        "model": cfg.model,
+        "condition": cfg.condition,
+    }
+    encoded = json.dumps(identity, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def condition_query_cache_path(cfg: SearchConfig) -> pathlib.Path:
+    return WORKSPACE_ROOT / "work" / "video-event-search" / "query-plans" / f"{condition_query_cache_key(cfg)}.json"
+
+
+def build_condition_query_prompt(cfg: SearchConfig) -> str:
+    return f"""
+You compile concise visual retrieval queries for an image-text retrieval model.
+
+The final vision-language verifier will receive the original condition verbatim.
+Your queries are only for broad retrieval recall, not for final truth.
+
+Condition:
+{cfg.condition}
+
+Return only one valid JSON object:
+{{
+  "queries": [
+    "short English visual search phrase"
+  ]
+}}
+
+Rules:
+- Produce 1 to 3 short English visual phrases.
+- Preserve the required subject, action/state, and spatial relation from the condition.
+- Do not add objects, colors, actions, or requirements that are not in the condition.
+- Do not broaden the condition into a different scene.
+- If the condition says something is not required, do not put that item in the query.
+- Use positive visual phrases that an image-text retrieval model can match.
+""".strip()
+
+
+def compile_condition_query_plan(cfg: SearchConfig) -> dict[str, Any]:
+    cache_path = condition_query_cache_path(cfg)
+    warnings: list[str] = []
+    condition_sha256 = hashlib.sha256(cfg.condition.encode("utf-8")).hexdigest()
+
+    if cache_path.exists():
+        try:
+            cached = json.loads(cache_path.read_text(encoding="utf-8"))
+            queries = normalize_compiled_queries(cached.get("queries"))
+            if queries:
+                return {
+                    "compiler_version": QUERY_COMPILER_VERSION,
+                    "condition_sha256": condition_sha256,
+                    "queries": queries,
+                    "source": "model",
+                    "cache_hit": True,
+                    "setup_request_count": 0,
+                    "fallback_reason": "",
+                    "warnings": [],
+                }
+            warnings.append("cached query plan had no usable queries")
+        except (OSError, json.JSONDecodeError) as exc:
+            warnings.append(f"ignored unreadable cached query plan: {exc}")
+
+    prompt = build_condition_query_prompt(cfg)
+    payload = {
+        "model": cfg.model,
+        "messages": [
+            {
+                "role": "user",
+                "content": prompt,
+            }
+        ],
+        "temperature": 0.0,
+        "top_p": 0.9,
+        "max_tokens": 180,
+    }
+
+    last_error = ""
+    setup_request_count = 0
+    for attempt in range(1, cfg.request_retries + 2):
+        setup_request_count = attempt
+        try:
+            response = post_json(f"{cfg.endpoint.rstrip('/')}/chat/completions", payload, cfg.request_timeout)
+            content = response["choices"][0]["message"]["content"].strip()
+            parsed = extract_json_object(content)
+            queries = normalize_compiled_queries(parsed.get("queries"))
+            if not queries:
+                last_error = "model returned an empty or invalid 'queries' list"
+                time.sleep(0.1)
+                continue
+            cache_payload = {
+                "compiler_version": QUERY_COMPILER_VERSION,
+                "condition_sha256": condition_sha256,
+                "model": cfg.model,
+                "queries": queries,
+                "created_at_unix": round(time.time(), 3),
+            }
+            try:
+                write_json_atomic(cache_path, cache_payload)
+            except OSError as exc:
+                warnings.append(f"could not write query plan cache: {exc}")
+            return {
+                "compiler_version": QUERY_COMPILER_VERSION,
+                "condition_sha256": condition_sha256,
+                "queries": queries,
+                "source": "model",
+                "cache_hit": False,
+                "setup_request_count": setup_request_count,
+                "fallback_reason": "",
+                "warnings": warnings,
+            }
+        except Exception as exc:
+            last_error = str(exc)
+            time.sleep(0.1)
+
+    fallback_query = " ".join(cfg.condition.strip().split())
+    return {
+        "compiler_version": QUERY_COMPILER_VERSION,
+        "condition_sha256": condition_sha256,
+        "queries": [fallback_query],
+        "source": "fallback",
+        "cache_hit": False,
+        "setup_request_count": setup_request_count,
+        "fallback_reason": last_error or "query compiler did not return usable queries",
+        "warnings": [*warnings, "using original condition as retrieval query"],
+    }
+
+
+def attach_condition_query_plan(cfg: SearchConfig, query_plan: dict[str, Any]) -> SearchConfig:
+    public_plan = {
+        "compiler_version": query_plan.get("compiler_version", QUERY_COMPILER_VERSION),
+        "condition_sha256": query_plan.get("condition_sha256", ""),
+        "queries": list(query_plan.get("queries", [])),
+        "source": query_plan.get("source", ""),
+        "cache_hit": bool(query_plan.get("cache_hit", False)),
+        "setup_request_count": int(query_plan.get("setup_request_count", 0)),
+        "fallback_reason": query_plan.get("fallback_reason", ""),
+        "warnings": list(query_plan.get("warnings", [])),
+    }
+    canonical = json.loads(json.dumps(cfg.canonical, ensure_ascii=False))
+    canonical["search"]["retrieval_query_plan"] = public_plan
+    return dataclasses.replace(
+        cfg,
+        retrieval_queries=tuple(public_plan["queries"]),
+        query_plan=public_plan,
+        canonical=canonical,
+    )
+
+
+def redact_config_text(text: str, cfg: SearchConfig) -> str:
+    redacted = str(text)
+    replacements: list[tuple[str, str]] = [(cfg.condition, "[condition]")]
+    replacements.extend((query, "[retrieval_query]") for query in getattr(cfg, "retrieval_queries", ()))
+    for term, replacement in replacements:
+        term = str(term).strip()
+        if not term:
+            continue
+        redacted = re.sub(re.escape(term), replacement, redacted, flags=re.IGNORECASE)
+    return redacted
 
 
 def import_retrieval_dependencies() -> tuple[Any, Any, Any, Any]:
@@ -644,7 +940,8 @@ def score_retrieval_frames(cfg: SearchConfig, scan_frames: list[dict[str, Any]])
     model = stack["model"]
     device = stack["device"]
 
-    text_inputs = processor(text=list(cfg.query_texts), padding=True, return_tensors="pt")
+    retrieval_queries = list(cfg.retrieval_queries or (cfg.condition,))
+    text_inputs = processor(text=retrieval_queries, padding=True, return_tensors="pt")
     text_inputs = tensor_to_device(text_inputs, device)
     with torch.no_grad():
         text_features = call_feature_method(model, "get_text_features", text_inputs)
@@ -676,7 +973,7 @@ def score_retrieval_frames(cfg: SearchConfig, scan_frames: list[dict[str, Any]])
             similarities = image_features @ text_features.T
         score_rows.extend([[float(value) for value in row] for row in similarities.detach().cpu().tolist()])
 
-    query_count = len(cfg.query_texts)
+    query_count = len(retrieval_queries)
     query_minimums = []
     query_maximums = []
     for query_index in range(query_count):
@@ -711,7 +1008,7 @@ def score_retrieval_frames(cfg: SearchConfig, scan_frames: list[dict[str, Any]])
             "retrieval_likelihood_score": round(likelihood_scores[index], 6),
             "retrieval_rank": rank,
             "best_query_index": query_indexes[index],
-            "best_query_label": "primary_query" if query_indexes[index] == 0 else f"query_texts[{query_indexes[index]}]",
+            "best_query_label": f"retrieval_query[{query_indexes[index] + 1}]",
             "selected_for_verification": False,
             "selection_reason": "",
         })
@@ -724,14 +1021,14 @@ def score_retrieval_frames(cfg: SearchConfig, scan_frames: list[dict[str, Any]])
         "score_normalization": "per_query_minmax_then_max",
         "query_raw_score_ranges": [
             {
-                "query_label": "primary_query" if index == 0 else f"query_texts[{index}]",
+                "query_label": f"retrieval_query[{index + 1}]",
                 "raw_score_min": round(query_minimums[index], 6),
                 "raw_score_max": round(query_maximums[index], 6),
             }
             for index in range(query_count)
         ],
-        "query_count": len(cfg.query_texts),
-        "query_labels": ["primary_query" if index == 0 else f"query_texts[{index}]" for index in range(len(cfg.query_texts))],
+        "query_count": len(retrieval_queries),
+        "query_labels": [f"retrieval_query[{index + 1}]" for index in range(len(retrieval_queries))],
     }
     return samples, metadata
 
@@ -827,33 +1124,44 @@ def select_retrieval_windows(cfg: SearchConfig, duration: float, retrieval_sampl
     return merged
 
 
-def build_verification_prompt(cfg: SearchConfig, center_time: float, before_time: float, after_time: float) -> str:
-    required_checks = "\n".join(f"- {item}" for item in cfg.required_visual_checks) or "- Use only the condition text above."
-    not_required_checks = "\n".join(f"- {item}" for item in cfg.not_required_visual_checks) or "- Do not add requirements that are not in the condition."
-    return f"""
-You are verifying a candidate frame from a local research video.
+def build_verification_prompt(
+    cfg: SearchConfig,
+    center_time: float,
+    before_time: float,
+    after_time: float,
+    verification_mode: str,
+) -> str:
+    if verification_mode == "single":
+        image_note = f"""
+Image:
+1. target frame at {center_time:.3f} seconds
 
+Use only this target frame. Do not infer what happened before or after it.
+""".strip()
+    else:
+        image_note = f"""
 Images are chronological:
 1. before frame at {before_time:.3f} seconds
 2. target frame at {center_time:.3f} seconds
 3. after frame at {after_time:.3f} seconds
 
+Use before/after frames only as nearby visual context.
+""".strip()
+    return f"""
+You are verifying a candidate frame from a local research video.
+
+{image_note}
+
 Condition to verify at the target frame:
 {cfg.condition}
 
-Required visual checks:
-{required_checks}
-
-Not required:
-{not_required_checks}
-
 Interpret the condition literally.
-The condition is true when the required visual checks are satisfied.
-Do not add any extra requirements.
+The condition text is the only source of truth.
+If the condition includes relaxed wording, exclusions, or "not required" details, obey those words exactly.
+Do not add hidden requirements such as color, contact, identity, or intent unless the condition explicitly requires them.
 First, describe only what is actually visible in the target frame.
 Do not copy words from the condition into the caption unless those things are plainly visible.
 Do not infer, guess, or complete missing visual facts from the condition text.
-Use before/after frames only as nearby visual context.
 
 Return only one valid JSON object. Do not wrap it in Markdown.
 Use {cfg.language} for caption and evidence.
@@ -863,8 +1171,6 @@ Required schema:
   "neutral_caption": "short factual caption of only what is visible in the target frame",
   "event_phase": "match | near_miss | unrelated | uncertain",
   "confidence_score": 0.0,
-  "is_match": false,
-  "required_visual_evidence": false,
   "evidence": "brief positive visual evidence, if any",
   "negative_evidence": "brief reason the condition is not satisfied, if applicable"
 }}
@@ -876,13 +1182,11 @@ event_phase guide:
 - uncertain: enough of the required visual evidence is present, but the truth is genuinely unclear.
 
 Consistency rules:
-- If neutral_caption or evidence says the full condition is visible, set event_phase to match, is_match to true, and required_visual_evidence to true.
+- If neutral_caption and evidence say the full condition is visible, set event_phase to match.
 - If event_phase is near_miss or unrelated, evidence must not restate the full condition as if it were true.
-- If event_phase is near_miss, negative_evidence must name the exact missing required element.
+- If event_phase is near_miss, negative_evidence must name the exact missing element from the condition.
 - If the only missing detail is minor ambiguity, use uncertain instead of near_miss.
-- Never reject the condition because of an item listed under Not required.
 
-required_visual_evidence should be true only when the required subject(s), action/state, and spatial relation needed by the condition are visible enough to judge.
 confidence_score is your confidence in the event_phase classification, from 0.0 to 1.0.
 """.strip()
 
@@ -894,16 +1198,13 @@ def normalize_verification_result(raw: dict[str, Any], cfg: SearchConfig) -> dic
     if phase not in EVENT_PHASES:
         phase = "uncertain"
     score = clamp_score(raw.get("confidence_score", raw.get("confidence", 0.0)))
-    raw_match = boolish(raw.get("is_match"))
-    required_visual_evidence = normalize_visual_evidence(raw.get("required_visual_evidence", False))
-    model_says_match = phase == "match" or raw_match is True
-    is_match = bool(model_says_match and required_visual_evidence and score >= cfg.score_threshold)
     caption = raw.get("neutral_caption", raw.get("caption", ""))
     evidence = str(raw.get("evidence", "")).strip()
     negative_evidence = str(raw.get("negative_evidence", "")).strip()
     caption_text = str(caption).strip()
-    caption_lower = caption_text.lower()
-    positive_text = f"{caption_text}\n{evidence}".lower()
+    caption_text = redact_config_text(caption_text, cfg)
+    evidence = redact_config_text(evidence, cfg)
+    negative_evidence = redact_config_text(negative_evidence, cfg)
     evidence_lower = evidence.lower()
     negative_markers = (
         "確認できない",
@@ -925,20 +1226,8 @@ def normalize_verification_result(raw: dict[str, Any], cfg: SearchConfig) -> dic
         "can't confirm",
     )
     evidence_has_negation = any(marker in evidence_lower for marker in negative_markers)
-    lexical_override = False
-    lexical_match_terms = getattr(cfg, "lexical_match_terms", ())
-    lexical_caption_terms = getattr(cfg, "lexical_caption_terms", ())
-    caption_terms_present = True
-    if lexical_caption_terms:
-        caption_terms_present = all(term.lower() in caption_lower for term in lexical_caption_terms)
-    if lexical_match_terms and score >= cfg.score_threshold and not evidence_has_negation and caption_terms_present:
-        lexical_override = all(term.lower() in positive_text for term in lexical_match_terms)
-    override_reason = ""
-    if not is_match and lexical_override:
-        is_match = True
-        phase = "match"
-        required_visual_evidence = True
-        override_reason = "lexical_match_terms were all present in neutral_caption/evidence"
+    has_affirmative_evidence = bool(evidence) and not evidence_has_negation
+    is_match = bool(phase == "match" and score >= cfg.score_threshold and has_affirmative_evidence)
     return {
         "caption": caption_text,
         "neutral_caption": caption_text,
@@ -947,45 +1236,52 @@ def normalize_verification_result(raw: dict[str, Any], cfg: SearchConfig) -> dic
         "score_threshold": cfg.score_threshold,
         "passed_threshold": score >= cfg.score_threshold,
         "is_match": is_match,
-        "required_visual_evidence": required_visual_evidence,
+        "has_affirmative_evidence": has_affirmative_evidence,
         "evidence": evidence,
         "negative_evidence": negative_evidence,
-        "override_reason": override_reason,
         "parse_ok": True,
     }
+
+
+def public_verification_images(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        {key: value for key, value in record.items() if not key.startswith("_")}
+        for record in records
+    ]
 
 
 def request_sample_judgment(
     cfg: SearchConfig,
     cache_dir: pathlib.Path,
     center_time: float,
-    before_frame: pathlib.Path,
-    center_frame: pathlib.Path,
-    after_frame: pathlib.Path,
+    image_records: list[dict[str, Any]],
     before_time: float,
     after_time: float,
+    verification_mode: str,
 ) -> dict[str, Any]:
-    result_path = cache_dir / "results" / f"sample_{sample_key(center_time)}.json"
+    result_path = cache_dir / "results" / f"sample_{sample_key(center_time)}_{verification_mode}.json"
     if result_path.exists():
         return json.loads(result_path.read_text(encoding="utf-8"))
 
     raw_dir = cache_dir / "raw-responses"
     raw_dir.mkdir(parents=True, exist_ok=True)
-    prompt = build_verification_prompt(cfg, center_time, before_time, after_time)
+    prompt = build_verification_prompt(cfg, center_time, before_time, after_time, verification_mode)
+    content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
+    role_names = {
+        "before": "Before frame",
+        "target": "Target frame",
+        "after": "After frame",
+    }
+    for record in image_records:
+        label = role_names.get(str(record["role"]), str(record["role"]).title())
+        content.append({"type": "text", "text": f"{label} at {float(record['time']):.3f}s"})
+        content.append({"type": "image_url", "image_url": {"url": image_data_url(record["_model_frame_abs"])}})
     payload = {
         "model": cfg.model,
         "messages": [
             {
                 "role": "user",
-                "content": [
-                    {"type": "text", "text": prompt},
-                    {"type": "text", "text": f"Before frame at {before_time:.3f}s"},
-                    {"type": "image_url", "image_url": {"url": image_data_url(before_frame)}},
-                    {"type": "text", "text": f"Target frame at {center_time:.3f}s"},
-                    {"type": "image_url", "image_url": {"url": image_data_url(center_frame)}},
-                    {"type": "text", "text": f"After frame at {after_time:.3f}s"},
-                    {"type": "image_url", "image_url": {"url": image_data_url(after_frame)}},
-                ],
+                "content": content,
             }
         ],
         "temperature": cfg.temperature,
@@ -998,19 +1294,29 @@ def request_sample_judgment(
     for attempt in range(1, cfg.request_retries + 2):
         response = post_json(f"{cfg.endpoint.rstrip('/')}/chat/completions", payload, cfg.request_timeout)
         content = response["choices"][0]["message"]["content"].strip()
-        raw_path = raw_dir / f"sample_{sample_key(center_time)}_attempt_{attempt}.txt"
+        raw_path = raw_dir / f"sample_{sample_key(center_time)}_{verification_mode}_attempt_{attempt}.txt"
         write_text_atomic(raw_path, content + "\n")
         raw_response_paths.append(workspace_path(raw_path))
         try:
             parsed = extract_json_object(content)
             result = normalize_verification_result(parsed, cfg)
+            target = next(item for item in image_records if item["role"] == "target")
+            before = next((item for item in image_records if item["role"] == "before"), None)
+            after = next((item for item in image_records if item["role"] == "after"), None)
             result.update({
                 "time": center_time,
                 "before_time": before_time,
                 "after_time": after_time,
-                "frame_path": workspace_path(center_frame),
-                "before_frame_path": workspace_path(before_frame),
-                "after_frame_path": workspace_path(after_frame),
+                "verification_mode": verification_mode,
+                "sent_image_count": len(image_records),
+                "verification_image_max_edge_pixels": cfg.verification_image_max_edge_pixels,
+                "verification_images": public_verification_images(image_records),
+                "frame_path": target["source_frame_path"],
+                "model_frame_path": target["model_frame_path"],
+                "model_input_width": target["model_input_width"],
+                "model_input_height": target["model_input_height"],
+                "before_frame_path": before["source_frame_path"] if before else "",
+                "after_frame_path": after["source_frame_path"] if after else "",
                 "raw_response_paths": raw_response_paths,
             })
             write_json_atomic(result_path, result)
@@ -1030,21 +1336,35 @@ def request_sample_judgment(
         "score_threshold": cfg.score_threshold,
         "passed_threshold": False,
         "is_match": False,
-        "required_visual_evidence": False,
+        "has_affirmative_evidence": False,
         "evidence": "",
         "negative_evidence": f"Model response could not be parsed as JSON: {last_error}",
-        "override_reason": "",
         "parse_ok": False,
-        "frame_path": workspace_path(center_frame),
-        "before_frame_path": workspace_path(before_frame),
-        "after_frame_path": workspace_path(after_frame),
+        "verification_mode": verification_mode,
+        "sent_image_count": len(image_records),
+        "verification_image_max_edge_pixels": cfg.verification_image_max_edge_pixels,
+        "verification_images": public_verification_images(image_records),
+        "frame_path": next(item for item in image_records if item["role"] == "target")["source_frame_path"],
+        "model_frame_path": next(item for item in image_records if item["role"] == "target")["model_frame_path"],
+        "model_input_width": next(item for item in image_records if item["role"] == "target")["model_input_width"],
+        "model_input_height": next(item for item in image_records if item["role"] == "target")["model_input_height"],
+        "before_frame_path": next((item["source_frame_path"] for item in image_records if item["role"] == "before"), ""),
+        "after_frame_path": next((item["source_frame_path"] for item in image_records if item["role"] == "after"), ""),
         "raw_response_paths": raw_response_paths,
     }
     write_json_atomic(result_path, result)
     return result
 
 
-def evaluate_sample(cfg: SearchConfig, cache_dir: pathlib.Path, duration: float, requested_time: float) -> dict[str, Any]:
+def evaluate_sample(
+    cfg: SearchConfig,
+    cache_dir: pathlib.Path,
+    duration: float,
+    requested_time: float,
+    verification_mode: str,
+) -> dict[str, Any]:
+    if verification_mode not in {"single", "triple"}:
+        raise ValueError(f"Unknown verification_mode: {verification_mode}")
     center_time = normalize_time(requested_time, duration)
     before_time = normalize_time(center_time - cfg.context_seconds, duration)
     after_time = normalize_time(center_time + cfg.context_seconds, duration)
@@ -1052,18 +1372,23 @@ def evaluate_sample(cfg: SearchConfig, cache_dir: pathlib.Path, duration: float,
     center_frame = frame_dir / f"t_{sample_key(center_time)}.jpg"
     before_frame = frame_dir / f"t_{sample_key(before_time)}.jpg"
     after_frame = frame_dir / f"t_{sample_key(after_time)}.jpg"
-    extract_frame(cfg.video_path, before_time, before_frame)
     extract_frame(cfg.video_path, center_time, center_frame)
-    extract_frame(cfg.video_path, after_time, after_frame)
+    image_records = []
+    if verification_mode == "triple":
+        extract_frame(cfg.video_path, before_time, before_frame)
+        image_records.append(resize_frame_for_verification(cfg, cache_dir, before_frame, "before", before_time))
+    image_records.append(resize_frame_for_verification(cfg, cache_dir, center_frame, "target", center_time))
+    if verification_mode == "triple":
+        extract_frame(cfg.video_path, after_time, after_frame)
+        image_records.append(resize_frame_for_verification(cfg, cache_dir, after_frame, "after", after_time))
     return request_sample_judgment(
         cfg,
         cache_dir,
         center_time,
-        before_frame,
-        center_frame,
-        after_frame,
+        image_records,
         before_time,
         after_time,
+        verification_mode,
     )
 
 
@@ -1071,6 +1396,31 @@ def sample_confidence(sample: Optional[dict[str, Any]]) -> float:
     if not sample:
         return 0.0
     return clamp_score(sample.get("confidence_score", 0.0))
+
+
+def should_confirm_primary(primary: dict[str, Any]) -> bool:
+    return primary.get("event_phase") in {"match", "near_miss", "uncertain"}
+
+
+def compose_evaluation_result(
+    primary: Optional[dict[str, Any]],
+    confirmation: Optional[dict[str, Any]],
+    verification_status: str,
+    confirmation_reason: str,
+) -> dict[str, Any]:
+    visible = confirmation or primary
+    if visible is None:
+        raise ValueError("At least one verification result is required.")
+    result = dict(visible)
+    result["primary_verification"] = primary
+    result["confirmation_verification"] = confirmation
+    result["verification_status"] = verification_status
+    result["confirmation_reason"] = confirmation_reason
+    result["candidate_is_match"] = bool(visible.get("is_match"))
+    result["is_match"] = bool(confirmation and confirmation.get("is_match"))
+    result["sent_image_count"] = (primary or {}).get("sent_image_count", 0) + (confirmation or {}).get("sent_image_count", 0)
+    result["vl_request_count"] = int(primary is not None) + int(confirmation is not None)
+    return result
 
 
 def evaluation_summary(item: dict[str, Any]) -> dict[str, Any]:
@@ -1085,10 +1435,21 @@ def evaluation_summary(item: dict[str, Any]) -> dict[str, Any]:
         "score_threshold": item.get("score_threshold", 0.0),
         "passed_threshold": item.get("passed_threshold", False),
         "is_match": item.get("is_match", False),
-        "required_visual_evidence": item.get("required_visual_evidence", False),
+        "candidate_is_match": item.get("candidate_is_match", item.get("is_match", False)),
+        "verification_status": item.get("verification_status", ""),
+        "confirmation_reason": item.get("confirmation_reason", ""),
+        "verification_mode": item.get("verification_mode", ""),
+        "sent_image_count": item.get("sent_image_count", 0),
+        "vl_request_count": item.get("vl_request_count", 0),
+        "model_input_width": item.get("model_input_width"),
+        "model_input_height": item.get("model_input_height"),
+        "verification_image_max_edge_pixels": item.get("verification_image_max_edge_pixels"),
+        "verification_images": item.get("verification_images", []),
+        "primary_verification": item.get("primary_verification"),
+        "confirmation_verification": item.get("confirmation_verification"),
+        "has_affirmative_evidence": item.get("has_affirmative_evidence", False),
         "evidence": item.get("evidence", ""),
         "negative_evidence": item.get("negative_evidence", ""),
-        "override_reason": item.get("override_reason", ""),
         "parse_ok": item.get("parse_ok", False),
         "frame_path": item.get("frame_path", ""),
     }
@@ -1187,6 +1548,15 @@ def build_result(
     samples = state_samples(state)
     occurrences = state.get("occurrences") or preliminary_occurrences(samples, cfg, duration)
     accepted_occurrences = [item for item in occurrences if item.get("status", "accepted") == "accepted"]
+    primary_count = sum(1 for item in samples if item.get("primary_verification"))
+    confirmation_count = sum(1 for item in samples if item.get("confirmation_verification"))
+    direct_triple_count = sum(
+        1
+        for item in samples
+        if item.get("verification_status") == "confirmed" and not item.get("primary_verification")
+    )
+    vl_request_count = state.get("vl_request_count", sum(int(item.get("vl_request_count", 1)) for item in samples))
+    sent_image_count = state.get("sent_image_count", sum(int(item.get("sent_image_count", 0)) for item in samples))
     if include_evidence:
         write_evidence_frames(cfg, duration, accepted_occurrences)
     status = status_override or ("incomplete" if incomplete_reason else ("found" if accepted_occurrences else "not_found"))
@@ -1195,6 +1565,7 @@ def build_result(
         "last_evaluated_time": round(samples[-1]["time"], 3) if samples else None,
         "last_evaluated_phase": samples[-1].get("phase", "") if samples else "",
         "sample_count": len(samples),
+        "vl_request_count": state.get("vl_request_count", 0),
         "candidate_window_count": len(state["candidate_windows"]),
         "updated_at_unix": round(time.time(), 3),
     }
@@ -1207,6 +1578,7 @@ def build_result(
             "path": project_path(cfg.video_path),
             "workspace_path": workspace_path(cfg.video_path),
             "duration_seconds": round(duration, 3),
+            **state.get("video_dimensions", {}),
         },
         "model": cfg.model,
         "strategy": cfg.strategy,
@@ -1226,6 +1598,7 @@ def build_result(
             "minimum_candidate_windows": cfg.minimum_candidate_windows,
             "max_candidate_windows": cfg.max_candidate_windows,
             "minimum_positive_samples": cfg.minimum_positive_samples,
+            "verification_image_max_edge_pixels": cfg.verification_image_max_edge_pixels,
             "max_evaluations": cfg.max_evaluations,
             "miss_risk_note": (
                 "retrieve_verify ranks every scan frame with a non-generative image-text encoder, "
@@ -1244,6 +1617,13 @@ def build_result(
         "verification": {
             "score_threshold": cfg.score_threshold,
             "sample_count": len(samples),
+            "vl_request_count": vl_request_count,
+            "primary_evaluation_count": primary_count,
+            "confirmation_evaluation_count": confirmation_count + direct_triple_count,
+            "single_image_evaluation_count": primary_count,
+            "three_image_evaluation_count": confirmation_count + direct_triple_count,
+            "total_sent_image_count": sent_image_count,
+            "verification_image_max_edge_pixels": cfg.verification_image_max_edge_pixels,
             "match_count": sum(1 for item in samples if item.get("is_match")),
             "evaluations": [evaluation_summary(item) for item in samples],
         },
@@ -1285,7 +1665,9 @@ def build_captions(samples: list[dict[str, Any]]) -> list[dict[str, Any]]:
         "event_phase": item.get("event_phase", "uncertain"),
         "confidence_score": item.get("confidence_score", 0.0),
         "is_match": item.get("is_match", False),
-        "required_visual_evidence": item.get("required_visual_evidence", False),
+        "candidate_is_match": item.get("candidate_is_match", item.get("is_match", False)),
+        "verification_status": item.get("verification_status", ""),
+        "has_affirmative_evidence": item.get("has_affirmative_evidence", False),
         "evidence": item.get("evidence", ""),
         "negative_evidence": item.get("negative_evidence", ""),
         "frame_path": item.get("frame_path", ""),
@@ -1304,7 +1686,8 @@ def write_captions_markdown(cfg: SearchConfig, captions: list[dict[str, Any]]) -
     for item in captions:
         lines.append(
             f"- {item['time']:.3f}s: {item['neutral_caption']} "
-            f"(phase: {item['event_phase']}, confidence: {item['confidence_score']:.3f}, match: {item['is_match']})"
+            f"(phase: {item['event_phase']}, confidence: {item['confidence_score']:.3f}, "
+            f"match: {item['is_match']}, verification: {item['verification_status']})"
         )
     write_text_atomic(cfg.output_dir / "captions.md", "\n".join(lines) + "\n")
 
@@ -1319,7 +1702,10 @@ def write_event_markdown(cfg: SearchConfig, result: dict[str, Any]) -> None:
         f"- Retrieval model: {cfg.retrieval_model}",
         f"- Retrieval scan interval: {cfg.scan_interval:g} seconds",
         f"- Local verification interval: {cfg.local_scan_interval:g} seconds",
-        f"- Samples verified by VL: {result['verification']['sample_count']}",
+        f"- Samples checked: {result['verification']['sample_count']}",
+        f"- VL requests: {result['verification']['vl_request_count']}",
+        f"- Sent images: {result['verification']['total_sent_image_count']}",
+        f"- Verification image max edge: {cfg.verification_image_max_edge_pixels if cfg.verification_image_max_edge_pixels is not None else 'disabled'} px",
         f"- Candidate windows: {len(result['retrieval_scan']['candidate_windows'])}",
         "",
         "## Search note",
@@ -1364,12 +1750,18 @@ def build_search_trace(cfg: SearchConfig, duration: float, cache_dir: pathlib.Pa
         "strategy": cfg.strategy,
         "cache_dir": workspace_path(cache_dir),
         "score_threshold": cfg.score_threshold,
+        "retrieval_query_plan": cfg.query_plan,
         "retrieval": state.get("retrieval_metadata", {}),
         "retrieval_samples": state["retrieval_samples"],
         "candidate_windows": state["candidate_windows"],
         "searched_windows": state["searched_windows"],
         "skipped_windows": state["skipped_windows"],
         "boundary_refinements": state["boundary_refinements"],
+        "verification": {
+            "vl_request_count": state.get("vl_request_count", 0),
+            "total_sent_image_count": state.get("sent_image_count", 0),
+            "verification_image_max_edge_pixels": cfg.verification_image_max_edge_pixels,
+        },
         "evaluations": [evaluation_summary(item) for item in state_samples(state)],
         "duration_seconds": round(duration, 3),
     }
@@ -1401,19 +1793,28 @@ def write_outputs(
 
 def new_state() -> dict[str, Any]:
     return {
+        "video_dimensions": {},
         "retrieval_samples": [],
         "retrieval_metadata": {},
         "candidate_windows": [],
         "evaluations": {},
+        "vl_request_count": 0,
+        "sent_image_count": 0,
         "searched_windows": [],
         "skipped_windows": [],
         "boundary_refinements": [],
         "occurrences": [],
+        "incomplete_reason": None,
     }
 
 
 def evaluation_limit_reached(cfg: SearchConfig, state: dict[str, Any]) -> bool:
-    return cfg.max_evaluations is not None and len(state["evaluations"]) >= cfg.max_evaluations
+    return cfg.max_evaluations is not None and int(state.get("vl_request_count", 0)) >= cfg.max_evaluations
+
+
+def record_vl_request(state: dict[str, Any], result: dict[str, Any]) -> None:
+    state["vl_request_count"] = int(state.get("vl_request_count", 0)) + 1
+    state["sent_image_count"] = int(state.get("sent_image_count", 0)) + int(result.get("sent_image_count", 0))
 
 
 def ensure_evaluation(
@@ -1426,25 +1827,71 @@ def ensure_evaluation(
     candidate_window_index: Optional[int],
     progress_writer: Any,
 ) -> bool:
-    if evaluation_limit_reached(cfg, state):
-        return False
     normalized = normalize_time(time_seconds, duration)
     key = sample_key(normalized)
     if key in state["evaluations"]:
         return True
-    print(f"Verifying {normalized:.3f}s ({phase})...", file=sys.stderr)
-    result = evaluate_sample(cfg, cache_dir, duration, normalized)
-    result["phase"] = phase
-    result["candidate_window_index"] = candidate_window_index
-    state["evaluations"][key] = result
-    progress_writer({
-        "stage": phase,
-        "last_evaluated_time": normalized,
-        "last_evaluated_phase": phase,
-        "sample_count": len(state["evaluations"]),
-        "candidate_window_count": len(state["candidate_windows"]),
-        "updated_at_unix": round(time.time(), 3),
-    })
+    if evaluation_limit_reached(cfg, state):
+        return False
+
+    def store_result(result: dict[str, Any], progress_stage: str) -> None:
+        result["phase"] = phase
+        result["candidate_window_index"] = candidate_window_index
+        state["evaluations"][key] = result
+        progress_writer({
+            "stage": progress_stage,
+            "last_evaluated_time": normalized,
+            "last_evaluated_phase": phase,
+            "sample_count": len(state["evaluations"]),
+            "vl_request_count": state.get("vl_request_count", 0),
+            "candidate_window_count": len(state["candidate_windows"]),
+            "updated_at_unix": round(time.time(), 3),
+        })
+
+    if phase == "local_scan":
+        print(f"Verifying {normalized:.3f}s ({phase}, single image)...", file=sys.stderr)
+        primary = evaluate_sample(cfg, cache_dir, duration, normalized, "single")
+        record_vl_request(state, primary)
+        result = compose_evaluation_result(
+            primary,
+            None,
+            "primary_only",
+            "single-image primary check did not require three-image confirmation",
+        )
+        store_result(result, f"{phase}_primary")
+        if not should_confirm_primary(primary):
+            return True
+        if evaluation_limit_reached(cfg, state):
+            blocked = compose_evaluation_result(
+                primary,
+                None,
+                "confirmation_blocked_by_max_evaluations",
+                "three-image confirmation was required, but max_evaluations was reached",
+            )
+            store_result(blocked, f"{phase}_confirmation_blocked")
+            return False
+        print(f"Verifying {normalized:.3f}s ({phase}, three-image confirmation)...", file=sys.stderr)
+        confirmation = evaluate_sample(cfg, cache_dir, duration, normalized, "triple")
+        record_vl_request(state, confirmation)
+        confirmed = compose_evaluation_result(
+            primary,
+            confirmation,
+            "confirmed",
+            f"primary event_phase={primary.get('event_phase', 'uncertain')} requires three-image confirmation",
+        )
+        store_result(confirmed, f"{phase}_confirm")
+        return True
+
+    print(f"Verifying {normalized:.3f}s ({phase}, three images)...", file=sys.stderr)
+    confirmation = evaluate_sample(cfg, cache_dir, duration, normalized, "triple")
+    record_vl_request(state, confirmation)
+    result = compose_evaluation_result(
+        None,
+        confirmation,
+        "confirmed",
+        "boundary refinement uses three-image verification",
+    )
+    store_result(result, phase)
     return True
 
 
@@ -1465,6 +1912,7 @@ def refine_boundary(
     while right - left > cfg.boundary_tolerance + 0.0005:
         midpoint = round((left + right) / 2.0, 3)
         if not ensure_evaluation(cfg, duration, cache_dir, state, midpoint, phase, candidate_window_index, progress_writer):
+            state["incomplete_reason"] = f"Stopped after max_evaluations={cfg.max_evaluations} VL requests."
             break
         sample = state["evaluations"][sample_key(midpoint)]
         if sample.get("is_match") == positive_is_right:
@@ -1531,7 +1979,7 @@ def finalize_occurrences(
     for index, occurrence in enumerate(refined, start=1):
         occurrence["index"] = index
     state["occurrences"] = refined
-    return None
+    return state.get("incomplete_reason")
 
 
 def run_search(
@@ -1547,6 +1995,7 @@ def run_search(
         "last_evaluated_time": None,
         "last_evaluated_phase": "",
         "sample_count": 0,
+        "vl_request_count": 0,
         "candidate_window_count": 0,
         "updated_at_unix": round(time.time(), 3),
     })
@@ -1566,6 +2015,7 @@ def run_search(
         "last_evaluated_time": None,
         "last_evaluated_phase": "retrieval",
         "sample_count": 0,
+        "vl_request_count": state.get("vl_request_count", 0),
         "candidate_window_count": len(state["candidate_windows"]),
         "updated_at_unix": round(time.time(), 3),
     })
@@ -1586,7 +2036,7 @@ def run_search(
         state["searched_windows"].append(window_record)
         for time_seconds in window["local_scan_times"]:
             if not ensure_evaluation(cfg, duration, cache_dir, state, time_seconds, "local_scan", window["index"], progress_writer):
-                incomplete_reason = f"Stopped after max_evaluations={cfg.max_evaluations}."
+                incomplete_reason = f"Stopped after max_evaluations={cfg.max_evaluations} VL requests."
                 break
         if incomplete_reason:
             break
@@ -1598,6 +2048,7 @@ def run_search(
             "last_evaluated_time": None,
             "last_evaluated_phase": "boundary",
             "sample_count": len(state["evaluations"]),
+            "vl_request_count": state.get("vl_request_count", 0),
             "candidate_window_count": len(state["candidate_windows"]),
             "updated_at_unix": round(time.time(), 3),
         })
@@ -1632,6 +2083,8 @@ def main() -> int:
         require_command("ffmpeg")
         require_command("ffprobe")
         cfg = load_config(pathlib.Path(args.input_json), args.endpoint, args.model)
+        query_plan = compile_condition_query_plan(cfg)
+        cfg = attach_condition_query_plan(cfg, query_plan)
         prepare_output_dir(cfg)
         duration = ffprobe_duration(cfg.video_path)
         cache_dir = WORKSPACE_ROOT / "work" / "video-event-search" / config_hash(cfg)
@@ -1643,6 +2096,7 @@ def main() -> int:
         })
 
         state = new_state()
+        state["video_dimensions"] = ffprobe_video_dimensions(cfg.video_path)
         incomplete_reason: Optional[str] = None
 
         def run_progress(progress: dict[str, Any]) -> None:

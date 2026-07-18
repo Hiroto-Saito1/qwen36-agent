@@ -1,13 +1,16 @@
 # Video event search: big_buck_bunny_5min.mp4
 
 - Status: found
-- Condition: 蝶が木の幹の近くに見えている
+- Condition: 木の幹に矢が刺さっている
 - Strategy: retrieve_verify
 - Retrieval model: google/siglip2-base-patch16-224
-- Retrieval scan interval: 2 seconds
+- Retrieval scan interval: 10 seconds
 - Local verification interval: 2 seconds
-- Samples verified by VL: 40
-- Candidate windows: 6
+- Samples checked: 28
+- VL requests: 35
+- Sent images: 57
+- Verification image max edge: 960 px
+- Candidate windows: 3
 
 ## Search note
 
@@ -17,13 +20,13 @@ retrieve_verify ranks every scan frame with a non-generative image-text encoder,
 
 ### Occurrence 1
 
-- Interval: 216.000s to 218.844s
-- Representative time: 218.000s
+- Interval: 295.761s to 296.761s
+- Representative time: 295.761s
 - Confidence: 1.000
-- Positive samples: 2
-- Matched sample times: 216.000s, 218.000s
-- Caption: 蝶が木の幹の近くに見えている
-- Evidence: 蝶が木の幹の近くに位置しており、木の幹が見えている。
-- Before frame: evidence/occurrence_001/before.jpg (217.000s)
-- Representative frame: evidence/occurrence_001/representative.jpg (218.000s)
-- After frame: evidence/occurrence_001/after.jpg (219.000s)
+- Positive samples: 1
+- Matched sample times: 295.761s
+- Caption: 矢が木の幹に刺さっている
+- Evidence: 矢が木の幹に刺さっている様子が確認できる。
+- Before frame: evidence/occurrence_001/before.jpg (294.761s)
+- Representative frame: evidence/occurrence_001/representative.jpg (295.761s)
+- After frame: evidence/occurrence_001/after.jpg (296.761s)
